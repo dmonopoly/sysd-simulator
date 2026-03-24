@@ -63,6 +63,8 @@ services:
       KAFKA_TOPIC: orders
       MAX_OPEN_CONNS: "10"
       CONNECT_TIMEOUT: 2s
+      KAFKA_TIMEOUT: 2s
+      WORKER_TIMEOUT: 10s
       BATCH_SIZE: "100"
       FLUSH_INTERVAL: 500ms
     depends_on:

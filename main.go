@@ -27,7 +27,9 @@ type Config struct {
 	KafkaBrokers   []string
 	KafkaTopic     string
 	MaxOpenConns   int
-	ConnectTimeout time.Duration
+	ConnectTimeout time.Duration // direct-write DB timeout only
+	KafkaTimeout   time.Duration // queue publish timeout
+	WorkerTimeout  time.Duration // worker COPY flush timeout
 	BatchSize      int
 	FlushInterval  time.Duration
 }
@@ -38,17 +40,32 @@ type Order struct {
 	Status string  `json:"status"`
 }
 
+// Metrics tracks counters for both write paths separately so that
+// serviceRatePerConn (mu) is computed only from direct-write timings,
+// keeping it comparable to the M/M/c model used in THEORY.md.
 type Metrics struct {
-	startedAt         time.Time
-	requestsTotal     atomic.Uint64
-	errorsTotal       atomic.Uint64
-	queuedAccepted    atomic.Uint64
-	directAccepted    atomic.Uint64
-	rowsWrittenTotal  atomic.Uint64
+	// Direct write path (one INSERT per request)
+	directRowsWritten  atomic.Uint64
+	directLatencyNanos atomic.Uint64
+
+	// Worker COPY flush path (N rows per flush)
+	workerRowsWritten  atomic.Uint64
+	workerLatencyNanos atomic.Uint64
+
+	// Rolling 10-second arrival rate window
+	requestsInWindow   atomic.Uint64
+	arrivalRateCurrent atomic.Uint64 // stored as requests/sec * 1000 (milliRPS) to avoid float atomics
+
+	// Queue accounting
 	producedMessages  atomic.Uint64
 	consumedMessages  atomic.Uint64
-	writeLatencyNanos atomic.Uint64
+
+	// Error counters
+	errorsTotal       atomic.Uint64
 	workerErrorsTotal atomic.Uint64
+
+	// Total request counter (for the status response)
+	requestsTotal atomic.Uint64
 }
 
 type App struct {
@@ -60,18 +77,20 @@ type App struct {
 }
 
 type statusResponse struct {
-	DBRows             int64   `json:"db_rows"`
-	QueueDepth         int64   `json:"queue_depth"`
-	ArrivalRateRPS     float64 `json:"arrival_rate_rps"`
-	AvgWriteLatencyMS  float64 `json:"avg_write_latency_ms"`
-	ServiceRatePerConn float64 `json:"service_rate_per_conn"`
-	ActiveConnections  int     `json:"active_connections"`
-	MaxConnections     int     `json:"max_connections"`
-	UtilizationRho     float64 `json:"utilization_rho"`
-	ErrorsTotal        uint64  `json:"errors_total"`
-	RequestsTotal      uint64  `json:"requests_total"`
-	RowsWrittenTotal   uint64  `json:"rows_written_total"`
-	WorkerErrorsTotal  uint64  `json:"worker_errors_total"`
+	DBRows                  int64   `json:"db_rows"`
+	QueueDepth              int64   `json:"queue_depth"`
+	ArrivalRateRPS          float64 `json:"arrival_rate_rps"`
+	AvgWriteLatencyMS       float64 `json:"avg_write_latency_ms"`
+	DirectServiceRatePerConn float64 `json:"direct_service_rate_per_conn"`
+	WorkerBatchThroughput   float64 `json:"worker_batch_throughput"`
+	ActiveConnections       int     `json:"active_connections"`
+	MaxConnections          int     `json:"max_connections"`
+	UtilizationRho          float64 `json:"utilization_rho"`
+	ErrorsTotal             uint64  `json:"errors_total"`
+	RequestsTotal           uint64  `json:"requests_total"`
+	DirectRowsWritten       uint64  `json:"direct_rows_written"`
+	WorkerRowsWritten       uint64  `json:"worker_rows_written"`
+	WorkerErrorsTotal       uint64  `json:"worker_errors_total"`
 }
 
 func main() {
@@ -117,10 +136,11 @@ func main() {
 		db:      db,
 		writer:  writer,
 		reader:  reader,
-		metrics: &Metrics{startedAt: time.Now()},
+		metrics: &Metrics{},
 	}
 
 	go app.runConsumer(ctx)
+	go app.runArrivalRateWindow(ctx)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.AppPort,
@@ -150,10 +170,13 @@ func main() {
 	}()
 
 	log.Printf(
-		"listening on :%s (topic=%s max_open_conns=%d batch_size=%d flush_interval=%s)",
+		"listening on :%s (topic=%s max_open_conns=%d connect_timeout=%s worker_timeout=%s kafka_timeout=%s batch_size=%d flush_interval=%s)",
 		cfg.AppPort,
 		cfg.KafkaTopic,
 		cfg.MaxOpenConns,
+		cfg.ConnectTimeout,
+		cfg.WorkerTimeout,
+		cfg.KafkaTimeout,
 		cfg.BatchSize,
 		cfg.FlushInterval,
 	)
@@ -171,6 +194,8 @@ func loadConfig() Config {
 		KafkaTopic:     getEnv("KAFKA_TOPIC", "orders"),
 		MaxOpenConns:   getEnvInt("MAX_OPEN_CONNS", 10),
 		ConnectTimeout: getEnvDuration("CONNECT_TIMEOUT", 2*time.Second),
+		KafkaTimeout:   getEnvDuration("KAFKA_TIMEOUT", 2*time.Second),
+		WorkerTimeout:  getEnvDuration("WORKER_TIMEOUT", 10*time.Second),
 		BatchSize:      getEnvInt("BATCH_SIZE", 100),
 		FlushInterval:  getEnvDuration("FLUSH_INTERVAL", 500*time.Millisecond),
 	}
@@ -187,6 +212,7 @@ func (a *App) routes() http.Handler {
 
 func (a *App) handleWriteDirect(w http.ResponseWriter, r *http.Request) {
 	a.metrics.requestsTotal.Add(1)
+	a.metrics.requestsInWindow.Add(1)
 
 	order, err := decodeOrder(r)
 	if err != nil {
@@ -205,8 +231,9 @@ func (a *App) handleWriteDirect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.metrics.directAccepted.Add(1)
-	a.recordWriteMetrics(time.Since(start), 1)
+	elapsed := time.Since(start)
+	a.metrics.directRowsWritten.Add(1)
+	a.metrics.directLatencyNanos.Add(uint64(elapsed))
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "inserted",
@@ -215,6 +242,7 @@ func (a *App) handleWriteDirect(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleWriteQueue(w http.ResponseWriter, r *http.Request) {
 	a.metrics.requestsTotal.Add(1)
+	a.metrics.requestsInWindow.Add(1)
 
 	order, err := decodeOrder(r)
 	if err != nil {
@@ -230,7 +258,10 @@ func (a *App) handleWriteQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.ConnectTimeout)
+	// KafkaTimeout is intentionally separate from ConnectTimeout so that
+	// tuning CONNECT_TIMEOUT to stress the direct path does not affect
+	// the queue publish path.
+	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.KafkaTimeout)
 	defer cancel()
 
 	if err := a.writer.WriteMessages(ctx, kafka.Message{Value: payload}); err != nil {
@@ -239,7 +270,6 @@ func (a *App) handleWriteQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.metrics.queuedAccepted.Add(1)
 	a.metrics.producedMessages.Add(1)
 
 	writeJSON(w, http.StatusAccepted, map[string]any{
@@ -259,18 +289,20 @@ func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	stats := a.db.Stats()
 	resp := statusResponse{
-		DBRows:             dbRows,
-		QueueDepth:         maxInt64(int64(a.metrics.producedMessages.Load())-int64(a.metrics.consumedMessages.Load()), 0),
-		ArrivalRateRPS:     a.arrivalRatePerSecond(),
-		AvgWriteLatencyMS:  a.avgWriteLatencyMS(),
-		ServiceRatePerConn: a.serviceRatePerConn(),
-		ActiveConnections:  stats.InUse,
-		MaxConnections:     a.cfg.MaxOpenConns,
-		UtilizationRho:     a.utilizationRho(),
-		ErrorsTotal:        a.metrics.errorsTotal.Load(),
-		RequestsTotal:      a.metrics.requestsTotal.Load(),
-		RowsWrittenTotal:   a.metrics.rowsWrittenTotal.Load(),
-		WorkerErrorsTotal:  a.metrics.workerErrorsTotal.Load(),
+		DBRows:                   dbRows,
+		QueueDepth:               maxInt64(int64(a.metrics.producedMessages.Load())-int64(a.metrics.consumedMessages.Load()), 0),
+		ArrivalRateRPS:           a.arrivalRatePerSecond(),
+		AvgWriteLatencyMS:        a.avgDirectWriteLatencyMS(),
+		DirectServiceRatePerConn: a.directServiceRatePerConn(),
+		WorkerBatchThroughput:    a.workerBatchThroughput(),
+		ActiveConnections:        stats.InUse,
+		MaxConnections:           a.cfg.MaxOpenConns,
+		UtilizationRho:           a.utilizationRho(),
+		ErrorsTotal:              a.metrics.errorsTotal.Load(),
+		RequestsTotal:            a.metrics.requestsTotal.Load(),
+		DirectRowsWritten:        a.metrics.directRowsWritten.Load(),
+		WorkerRowsWritten:        a.metrics.workerRowsWritten.Load(),
+		WorkerErrorsTotal:        a.metrics.workerErrorsTotal.Load(),
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -278,6 +310,28 @@ func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// runArrivalRateWindow updates arrivalRateCurrent every 10 seconds by
+// computing the rate over the elapsed window and resetting the counter.
+// This gives a near-real-time arrival rate rather than a lifetime average,
+// so utilization_rho reflects actual current load.
+func (a *App) runArrivalRateWindow(ctx context.Context) {
+	const windowSeconds = 10
+	ticker := time.NewTicker(windowSeconds * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			count := a.metrics.requestsInWindow.Swap(0)
+			// Store as milliRPS (x1000) to preserve sub-1 precision in an integer atomic.
+			milliRPS := (count * 1000) / windowSeconds
+			a.metrics.arrivalRateCurrent.Store(milliRPS)
+		}
+	}
 }
 
 func (a *App) runConsumer(ctx context.Context) {
@@ -365,7 +419,10 @@ func (a *App) flushBatch(ctx context.Context, messages []kafka.Message, orders [
 		return nil
 	}
 
-	flushCtx, cancel := context.WithTimeout(ctx, a.cfg.ConnectTimeout)
+	// WorkerTimeout is deliberately larger than ConnectTimeout so that
+	// tuning CONNECT_TIMEOUT to stress the direct path doesn't also cause
+	// the worker to time out on its own flushes.
+	flushCtx, cancel := context.WithTimeout(ctx, a.cfg.WorkerTimeout)
 	defer cancel()
 
 	start := time.Now()
@@ -379,8 +436,10 @@ func (a *App) flushBatch(ctx context.Context, messages []kafka.Message, orders [
 		return err
 	}
 
+	elapsed := time.Since(start)
 	a.metrics.consumedMessages.Add(uint64(len(messages)))
-	a.recordWriteMetrics(time.Since(start), len(orders))
+	a.metrics.workerRowsWritten.Add(uint64(len(orders)))
+	a.metrics.workerLatencyNanos.Add(uint64(elapsed))
 	return nil
 }
 
@@ -464,55 +523,63 @@ func (o *Order) normalize() {
 	}
 }
 
-func (a *App) recordWriteMetrics(duration time.Duration, rows int) {
-	if rows <= 0 {
-		return
-	}
-	a.metrics.rowsWrittenTotal.Add(uint64(rows))
-	a.metrics.writeLatencyNanos.Add(uint64(duration))
-}
-
-func (a *App) avgWriteLatencyMS() float64 {
-	rows := a.metrics.rowsWrittenTotal.Load()
+// avgDirectWriteLatencyMS returns the average per-row latency for the
+// direct INSERT path only. This is the empirical 1/mu value for THEORY.md.
+func (a *App) avgDirectWriteLatencyMS() float64 {
+	rows := a.metrics.directRowsWritten.Load()
 	if rows == 0 {
 		return 0
 	}
-
-	totalNanos := a.metrics.writeLatencyNanos.Load()
+	totalNanos := a.metrics.directLatencyNanos.Load()
 	avg := float64(totalNanos) / float64(rows)
 	return avg / float64(time.Millisecond)
 }
 
-func (a *App) serviceRatePerConn() float64 {
-	rows := a.metrics.rowsWrittenTotal.Load()
+// directServiceRatePerConn returns mu: empirical writes/sec that one DB
+// connection sustains on the direct path. Only valid when direct writes
+// have been observed; returns 0 otherwise.
+func (a *App) directServiceRatePerConn() float64 {
+	rows := a.metrics.directRowsWritten.Load()
 	if rows == 0 {
 		return 0
 	}
-
-	totalSeconds := float64(a.metrics.writeLatencyNanos.Load()) / float64(time.Second)
+	totalSeconds := float64(a.metrics.directLatencyNanos.Load()) / float64(time.Second)
 	if totalSeconds <= 0 {
 		return 0
 	}
-
 	return float64(rows) / totalSeconds
 }
 
-func (a *App) arrivalRatePerSecond() float64 {
-	uptime := time.Since(a.metrics.startedAt).Seconds()
-	if uptime <= 0 {
+// workerBatchThroughput returns total worker rows/sec across all COPY flushes.
+// This is a throughput number, not a per-connection rate; it should not be
+// used as mu in the M/M/c formula.
+func (a *App) workerBatchThroughput() float64 {
+	rows := a.metrics.workerRowsWritten.Load()
+	if rows == 0 {
 		return 0
 	}
-
-	return float64(a.metrics.requestsTotal.Load()) / uptime
+	totalSeconds := float64(a.metrics.workerLatencyNanos.Load()) / float64(time.Second)
+	if totalSeconds <= 0 {
+		return 0
+	}
+	return float64(rows) / totalSeconds
 }
 
+// arrivalRatePerSecond returns the 10-second rolling window arrival rate.
+// It returns 0 until the first window tick (10 seconds after startup).
+func (a *App) arrivalRatePerSecond() float64 {
+	return float64(a.metrics.arrivalRateCurrent.Load()) / 1000.0
+}
+
+// utilizationRho computes lambda / (c * mu) using only the direct-write
+// metrics. This matches the M/M/c formula described in THEORY.md.
 func (a *App) utilizationRho() float64 {
-	serviceRate := a.serviceRatePerConn()
-	if serviceRate <= 0 || a.cfg.MaxOpenConns <= 0 {
+	mu := a.directServiceRatePerConn()
+	if mu <= 0 || a.cfg.MaxOpenConns <= 0 {
 		return 0
 	}
-
-	rho := a.arrivalRatePerSecond() / (float64(a.cfg.MaxOpenConns) * serviceRate)
+	lambda := a.arrivalRatePerSecond()
+	rho := lambda / (float64(a.cfg.MaxOpenConns) * mu)
 	if math.IsNaN(rho) || math.IsInf(rho, 0) {
 		return 0
 	}
@@ -566,10 +633,10 @@ func getEnvInt(key string, fallback int) int {
 }
 
 func getEnvDuration(key string, fallback time.Duration) time.Duration {
-	value := getEnv(key, fallback.String())
-	parsed, err := time.ParseDuration(value)
+	raw := getEnv(key, fallback.String())
+	parsed, err := time.ParseDuration(raw)
 	if err != nil {
-		log.Printf("invalid duration for %s=%q, using %s", key, value, fallback)
+		log.Printf("invalid duration for %s=%q, using %s", key, raw, fallback)
 		return fallback
 	}
 	return parsed
